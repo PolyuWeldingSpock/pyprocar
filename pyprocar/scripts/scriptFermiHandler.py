@@ -216,6 +216,7 @@ class FermiHandler:
                                             kpoints=self.ebs.kpoints,
                                             bands=self.ebs.bands[:,:,spin],
                                             bands_to_keep = bands_to_keep,
+                                            ebs=self.ebs,
                                             spd=spd[:,:,ispin],
                                             spd_spin=spd_spin,
                                             colors = colors,

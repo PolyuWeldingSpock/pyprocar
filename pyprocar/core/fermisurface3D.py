@@ -84,163 +84,168 @@ class FermiSurface3D(Surface):
         This is used to add padding to the array 
         to assist in the calculation of the isosurface.
     """
+    def __init__(self, ebs: np.ndarray, 
+                 **kwargs):
+        self.ebs = copy.deepcopy(ebs)
+        self.kwargs = kwargs
 
-    def __init__(
-        self,
-        kpoints: np.ndarray,
-        bands: np.ndarray,
-        fermi: float,
-        reciprocal_lattice: np.ndarray,
+        self._initialize_data()
+        self._preprocess_data()
+        full_isosurface, self.isosurfaces = self._generate_isosurfaces()
 
-        ebs=None,
-        bands_to_keep: List[int]=None,
-        spd: np.ndarray=None,
-        spd_spin:np.ndarray=None,
+        super().__init__(verts=full_isosurface.points, faces=full_isosurface.faces)
 
-        fermi_shift: float=0.0,
-        fermi_tolerance:float=0.1,
-        interpolation_factor: int=1,
-        colors: List[str] or List[Tuple[float,float,float]]=None,
-        surface_color: str or Tuple[float,float,float, float]=None,
-        projection_accuracy: str="Normal",
-        cmap: str="viridis",
-        vmin: float=0,
-        vmax: float=1,
-        supercell: List[int]=[1, 1, 1],
-        # sym: bool=False
-        ):
 
     
-        self.kpoints = kpoints
-        
-        # Shifts kpoints between [0.5,0.5)
-        bound_ops = -1.0*(self.kpoints > 0.5) + 1.0*(self.kpoints <= -0.5)
-        self.XYZ = self.kpoints + bound_ops
+    def _initialize_data(self):
+        """
+        Initialize the data for the Fermi surface calculation.
+        """
+        # Process input arguments and set default values
+        self.bands_to_keep = self.kwargs.get('bands_to_keep', None)
+        self.spin = self.kwargs.get('spin', 0)
+        self.spd = self.kwargs.get('spd', None)
+        self.spd_spin = self.kwargs.get('spd_spin', None)
+        self.fermi_shift = self.kwargs.get('fermi_shift', 0.0)
+        self.fermi_tolerance = self.kwargs.get('fermi_tolerance', 0.1)
+        self.interpolation_factor = self.kwargs.get('interpolation_factor', 1)
+        self.colors = self.kwargs.get('colors',None)
+        self.surface_color = self.kwargs.get('surface_color', None)
+        self.projection_accuracy = self.kwargs.get('projection_accuracy', "high")
+        self.cmap = self.kwargs.get('cmap', "viridis")
+        self.vmin = self.kwargs.get('vmin', 0)
+        self.vmax = self.kwargs.get('vmax', 1)
+        self.supercell = np.array(self.kwargs.get('supercell', [1, 1, 1]))
 
-        self.bands = bands 
-
-        if bands_to_keep is None:
-            bands_to_keep = len(self.bands[0,:])
-        elif len(bands_to_keep) < len(self.bands[0,:]) :
-            self.bands = self.bands[:,bands_to_keep]
-
-        self.reciprocal_lattice = reciprocal_lattice
-
-        self.supercell = np.array(supercell)
-        self.fermi = fermi + fermi_shift
-        self.interpolation_factor = interpolation_factor
-        self.projection_accuracy = projection_accuracy
-        self.spd = spd
-        self.spd_spin = spd_spin
-
+        # Initialize other class attributes
+        self.full_isosurface = None
         self.brillouin_zone = self._get_brilloin_zone(self.supercell)
-
-        self.cmap = cmap
-        self.vmin = vmin
-        self.vmax = vmax
-        
-        # Finding bands with a fermi iso-surface. This reduces searching
-        fullBandIndex = []
-        reducedBandIndex = []
-        for iband in range(len(self.bands[0,:])):
-            fermi_surface_test = len(np.where(np.logical_and(self.bands[:,iband]>=self.fermi-fermi_tolerance, self.bands[:,iband]<=self.fermi+fermi_tolerance))[0])
-            if fermi_surface_test != 0:
-                fullBandIndex.append(iband)
-        if len(fullBandIndex)==0:
-            raise Exception("No bands within tolerance. Increase tolerance to increase search space.")
-        self.bands = self.bands[:,fullBandIndex]
-
-        # re-index and creates a mapping to the original bandindex
-        reducedBandIndex = np.arange(len(self.bands[0,:]))
-        self.fullBandIndex = fullBandIndex
-        self.reducedBandIndex = reducedBandIndex
-        self.reducedBandIndex_to_fullBandIndex = {f"{key}":value for key,value in zip(reducedBandIndex,fullBandIndex)}
-        self.fullBandIndex_to_reducedBandIndex = {f"{key}":value for key,value in zip(fullBandIndex,reducedBandIndex)}
-        reduced_bands_to_keep_index = [iband for iband in range(len(bands_to_keep))]
-
-        # Generate unique rgba values for the bands
-        nsurface = len(self.bands[0,:])
-        if surface_color:
-            solid_color_surface = np.arange(nsurface ) / nsurface
-
-            if isinstance(surface_color,str):
-                surface_color = mpcolors.to_rgba_array(surface_color, alpha =1 )[0,:]
-            band_colors = np.array([surface_color for x in solid_color_surface[:]]).reshape(-1, 4)
-        elif colors:
-            band_colors =[]
-            for color in colors:
-                if isinstance(color,str):
-                    color = mpcolors.to_rgba_array(color, alpha =1 )[0,:]
-                    band_colors.append(color)
-        else:
-            norm = mpcolors.Normalize(vmin=vmin, vmax=vmax)
-            cmap = cm.get_cmap(cmap)
-            solid_color_surface = np.arange(nsurface ) / nsurface
-            band_colors = np.array([cmap(norm(x)) for x in solid_color_surface[:]]).reshape(-1, 4)
-
-        # The following loop generates iso surfaces for each band and then stores them in a list
-        color_band_dict = {}
-
-        self.isosurfaces = []
-        full_isosurface = None
-        iband_with_surface=0
-        for iband in  range(self.bands.shape[1]):
-            isosurface_band = Isosurface(
-                                XYZ=self.XYZ,
-                                V=self.bands[:,iband],
-                                isovalue=self.fermi,
-                                algorithm="lewiner",
-                                interpolation_factor=interpolation_factor,
-                                padding=self.supercell,
-                                transform_matrix=self.reciprocal_lattice,
-                                boundaries=self.brillouin_zone,
-                            )
-
-            # Following condition will handle initializing of fermi isosurface
-            isosurface_band_copy = copy.deepcopy(isosurface_band)
-            if full_isosurface is None and len(isosurface_band_copy.points)!=0:
-                full_isosurface = isosurface_band_copy    
-            elif len(isosurface_band_copy.points)==0:
-                if full_isosurface is None and iband == len(self.bands[0,:])-1:
-                    # print(full_isosurface)
-                    raise Exception("Could not find any fermi surfaces")
-                continue
-            else:    
-                full_isosurface += isosurface_band_copy
-
-            color_band_dict.update({f"band_{iband_with_surface}": {"color" : band_colors[iband_with_surface,:]} })
-            band_color = np.array([band_colors[iband_with_surface,:]]*len(isosurface_band.points[:,0]))
-            isosurface_band.point_data[f"band_{iband_with_surface}"] = band_color
-            self.isosurfaces.append(isosurface_band)
-            iband_with_surface +=1
-
-        # Initialize the Fermi Surface which is the combination of all the 
-        # isosurface for each band
-        super().__init__(verts=full_isosurface.points, faces=full_isosurface.faces)
-        self.fermi_surface_area = self.area
-        
-        # Remapping of the scalar arrays into the combind mesh  
-        count = 0
-        combined_band_color_array = []
-        for iband,isosurface_band in enumerate(self.isosurfaces):
-            new_color_array = []
-            color_array_name = isosurface_band.point_data.keys()[0]
-            for points in self.points:
-                if points in isosurface_band.points:
-                    new_color_array.append(color_band_dict[color_array_name]['color'])    
-                else:
-                    new_color_array.append(np.array([0,0,0,1]))
-
-            for ipoints in range(len(isosurface_band.points)):
-                combined_band_color_array.append(color_band_dict[color_array_name]['color'])
-            i_reduced_band = color_array_name.split('_')[1]
-
-            self.point_data[ "band_"+ str(self.reducedBandIndex_to_fullBandIndex[str(i_reduced_band)])] = np.array(new_color_array)
-        self.point_data["bands"] = np.array(combined_band_color_array ) 
+        self.color_band_dict = {} 
         return None
-        
 
-    def create_vector_texture(self,
+    def _preprocess_data(self):
+        """Preprocessing the ElectronicBandStructure. 
+        """
+
+        self._move_kpoints()
+        self._keep_user_defined_bands()
+        self._find_bands_near_fermi_level()
+        
+        return None
+
+    def _move_kpoints(self):
+        """Moves kpoints in between -0.5,0.5
+        """
+        bound_ops = -1.0*(self.ebs.kpoints > 0.5) + 1.0*(self.ebs.kpoints <= -0.5)
+        self.ebs.kpoints = self.ebs.kpoints + bound_ops
+        return None
+    
+    def _keep_user_defined_bands(self):
+        """Reduce the number of bands as defined by the user with band_to_keep
+        """
+        self.ebs.bands = self.ebs.bands[:,:,self.spin]
+        if self.bands_to_keep is None:
+            self.bands_to_keep = len(self.ebs.bands[0,:])
+        elif len(self.bands_to_keep) < len(self.ebs.bands[0,:]) :
+            self.ebs.bands = self.ebs.bands[:,self.bands_to_keep]
+        return None
+    
+    def _find_bands_near_fermi_level(self):
+        """In the case of a fermi surfaces not all bands are important, 
+        only using isosurface near the fermi level will speed the calculation up
+
+        Raises
+        ------
+        Exception
+            No bands within tolerance. Increase tolerance to increase search space.
+        """
+        # Find the bands within the Fermi level tolerance
+        bands_within_tolerance = np.logical_and(
+            self.ebs.bands >= self.ebs.efermi - self.fermi_tolerance,
+            self.ebs.bands <= self.ebs.efermi + self.fermi_tolerance
+        )
+        full_band_indices = np.unique(np.where(bands_within_tolerance)[1])
+
+        if not full_band_indices.size:
+            raise Exception("No bands within tolerance. Increase tolerance to increase search space.")
+        
+        # Update bands with only those within the Fermi level tolerance
+        self.ebs.bands = self.ebs.bands[:, full_band_indices]
+
+        # Create mapping between full and reduced band indices
+        reduced_band_indices = np.arange(full_band_indices.size)
+
+        self._reduced_to_full_index_map = dict(zip(reduced_band_indices, full_band_indices))
+        self._full_to_reduced_index_map = dict((reversed(item) for item in self._reduced_to_full_index_map .items()))
+        # self.fullBandIndex_to_reducedBandIndex = dict(zip(full_band_indices, reduced_band_indices))
+        # reduced_bands_to_keep_index = [iband for iband in range(len(self.bands_to_keep))]
+        return None
+    
+    def _generate_isosurfaces(self):
+        """
+        Generate isosurfaces for each band and stores them in a list
+        """
+        isosurfaces = []
+
+        # Loop through each band and generate isosurface
+        for iband in range(self.ebs.bands.shape[1]):
+            isosurface_band = Isosurface(
+                XYZ=self.ebs.kpoints,
+                V=self.ebs.bands[:, iband],
+                isovalue=self.ebs.efermi,
+                algorithm="lewiner",
+                interpolation_factor=self.interpolation_factor,
+                padding=self.supercell,
+                transform_matrix=self.ebs.reciprocal_lattice,
+                boundaries=self.brillouin_zone,
+            )
+
+            # Add to list of isosurfaces
+            isosurfaces.append(isosurface_band)
+
+        full_isosurface = self._combine_isosurfaces(isosurfaces)
+
+        return full_isosurface,isosurfaces
+    
+    def _combine_isosurfaces(self,isosurfaces):
+        "Combines the isosurface into a single object"
+        # Initializing the full surface with first isosurface_band
+        full_isosurface = copy.deepcopy(isosurfaces[0])
+        for isosurface in isosurfaces[1:]:
+            full_isosurface += copy.deepcopy(isosurface)
+        return full_isosurface
+
+    @property
+    def n_bands(self):
+        """
+        The number of bands that compose the fermi surface
+        """
+        return len(self.isosurfaces)
+    
+    @property
+    def reduced_to_full_index_map(self):
+        """
+        This will map the index of the isosurface, which represent bands in the fermi surface, 
+        to the index in the ebs.bands
+        """
+        return self._reduced_to_full_index_map
+    
+    @property
+    def full_to_reduced_index_map(self):
+        """
+        This will map  the index in the ebs.bands to the index of the isosurface, 
+        which represent bands in the fermi surface, 
+        """
+        return self._full_to_reduced_index_map
+    
+    @property
+    def n_points(self):
+        """
+        This is the total number of points that compose the fermi surface
+        """
+        return  len(self.points)
+
+    def add_vector_texture(self,
                             vectors_array: np.ndarray, 
                             vectors_name: str="vector" ):
         """
@@ -258,14 +263,14 @@ class FermiSurface3D(Surface):
         final_vectors_Y = []
         final_vectors_Z = []
         for iband, isosurface in enumerate(self.isosurfaces):
-            XYZ_extended = self.XYZ.copy()
+            XYZ_extended = self.ebs.kpoints.copy()
             vectors_extended_X = vectors_array[:,iband,0].copy()
             vectors_extended_Y = vectors_array[:,iband,1].copy()
             vectors_extended_Z = vectors_array[:,iband,2].copy()
-    
+
             for ix in range(3):
                 for iy in range(self.supercell[ix]):
-                    temp = self.XYZ.copy()
+                    temp = self.ebs.kpoints.copy()
                     temp[:, ix] += 1 * (iy + 1)
                     XYZ_extended = np.append(XYZ_extended, temp, axis=0)
                     vectors_extended_X = np.append(
@@ -277,7 +282,7 @@ class FermiSurface3D(Surface):
                     vectors_extended_Z = np.append(
                         vectors_extended_Z, vectors_array[:,iband,2], axis=0
                     )
-                    temp = self.XYZ.copy()
+                    temp = self.ebs.kpoints.copy()
                     temp[:, ix] -= 1 * (iy + 1)
                     XYZ_extended = np.append(XYZ_extended, temp, axis=0)
                     vectors_extended_X = np.append(
@@ -290,7 +295,7 @@ class FermiSurface3D(Surface):
                         vectors_extended_Z, vectors_array[:,iband,2], axis=0
                     )
     
-            XYZ_transformed = np.dot(XYZ_extended, self.reciprocal_lattice)
+            XYZ_transformed = np.dot(XYZ_extended, self.ebs.reciprocal_lattice)
     
             if self.projection_accuracy.lower()[0] == "n":
                
@@ -322,74 +327,7 @@ class FermiSurface3D(Surface):
                 
         self.set_vectors(final_vectors_X, final_vectors_Y, final_vectors_Z,vectors_name = vectors_name)
         return None
-            
-    def create_spin_texture(self):
-        """
-        This method will create the spin textures for the 3d fermi surface in the case of a non-colinear calculation
-        """
-        if self.spd_spin is not None:
-            XYZ_extended = self.XYZ.copy()
-            vectors_extended_X = self.spd_spin[0].copy()
-            vectors_extended_Y = self.spd_spin[1].copy()
-            vectors_extended_Z = self.spd_spin[2].copy()
 
-            for ix in range(3):
-                for iy in range(self.supercell[ix]):
-                    temp = self.XYZ.copy()
-                    temp[:, ix] += 1 * (iy + 1)
-                    XYZ_extended = np.append(XYZ_extended, temp, axis=0)
-                    vectors_extended_X = np.append(
-                        vectors_extended_X, self.spd_spin[0], axis=0
-                    )
-                    vectors_extended_Y = np.append(
-                        vectors_extended_Y, self.spd_spin[1], axis=0
-                    )
-                    vectors_extended_Z = np.append(
-                        vectors_extended_Z, self.spd_spin[2], axis=0
-                    )
-                    temp = self.XYZ.copy()
-                    temp[:, ix] -= 1 * (iy + 1)
-                    XYZ_extended = np.append(XYZ_extended, temp, axis=0)
-                    vectors_extended_X = np.append(
-                        vectors_extended_X, self.spd_spin[0], axis=0
-                    )
-                    vectors_extended_Y = np.append(
-                        vectors_extended_Y, self.spd_spin[1], axis=0
-                    )
-                    vectors_extended_Z = np.append(
-                        vectors_extended_Z, self.spd_spin[2], axis=0
-                    )
-
-
-
-            XYZ_transformed = np.dot(XYZ_extended, self.reciprocal_lattice)
-            if self.projection_accuracy.lower()[0] == "n":
-
-                spin_X = interpolate.griddata(
-                    XYZ_transformed, vectors_extended_X, self.points, method="nearest"
-                )
-                spin_Y = interpolate.griddata(
-                    XYZ_transformed, vectors_extended_Y, self.points, method="nearest"
-                )
-                spin_Z = interpolate.griddata(
-                    XYZ_transformed, vectors_extended_Z, self.points, method="nearest"
-                )
-
-            elif self.projection_accuracy.lower()[0] == "h":
-
-                spin_X = interpolate.griddata(
-                    XYZ_transformed, vectors_extended_X, self.points, method="linear"
-                )
-                spin_Y = interpolate.griddata(
-                    XYZ_transformed, vectors_extended_Y, self.points, method="linear"
-                )
-                spin_Z = interpolate.griddata(
-                    XYZ_transformed, vectors_extended_Z, self.points, method="linear"
-                )
-
-            self.set_vectors(spin_X, spin_Y, spin_Z)
-            return None
-   
     def project_color(self, 
                     scalars_array:np.ndarray,
                     scalar_name:str="scalars"):
@@ -409,22 +347,22 @@ class FermiSurface3D(Surface):
         """
         final_scalars = []
         for iband, isosurface in enumerate(self.isosurfaces):
-            XYZ_extended = self.XYZ.copy()
+            XYZ_extended = self.ebs.kpoints.copy()
             scalars_extended =  scalars_array[:,iband].copy()
     
     
             for ix in range(3):
                 for iy in range(self.supercell[ix]):
-                    temp = self.XYZ.copy()
+                    temp = self.ebs.kpoints.copy()
                     temp[:, ix] += 1 * (iy + 1)
                     XYZ_extended = np.append(XYZ_extended, temp, axis=0)
                     scalars_extended = np.append(scalars_extended,  scalars_array[:,iband], axis=0)
-                    temp = self.XYZ.copy()
+                    temp = self.ebs.kpoints.copy()
                     temp[:, ix] -= 1 * (iy + 1)
                     XYZ_extended = np.append(XYZ_extended, temp, axis=0)
                     scalars_extended = np.append(scalars_extended,  scalars_array[:,iband], axis=0)
   
-            XYZ_transformed = np.dot(XYZ_extended, self.reciprocal_lattice)
+            XYZ_transformed = np.dot(XYZ_extended, self.ebs.reciprocal_lattice)
     
             if self.projection_accuracy.lower()[0] == "n":
                 colors = interpolate.griddata(
@@ -439,306 +377,345 @@ class FermiSurface3D(Surface):
 
         self.set_scalars(final_scalars, scalar_name = scalar_name)
         return None
-        # self.set_color_with_cmap(cmap, vmin, vmax)
+    
+    
+    
+    
+    # def _set_band_point_data(self):
+    #     """
+    #     Set the point data for the Fermi surface.
+    #     """
+
+    #     self.fermi_surface_area = self.area
+    #     combined_band_color_array = []
+    #     for iband, isosurface in enumerate(self.isosurfaces):
+
+    #         # creat list to store colors
+    #         new_color_array = []
+    #         color_array_name = list(isosurface.point_data.keys())[0]
+    #         band_color = isosurface.point_data[color_array_name]
+
+    #         # Iterate over full surface points to apply band color in the correct order
+    #         for point in self.points:
+    #             # Check if point on full surface is on band isosurface
+    #             if point in isosurface.points:
+    #                 new_color_array.append(band_color)
+    #             else:
+    #                 new_color_array.append(np.array([0, 0, 0, 1]))
+            
+    #         # Iterate over band isosurface 
+    #         for _ in range(len(isosurface.points)):
+    #             combined_band_color_array.append(band_color)
+
+    #         # i_reduced_band = int(color_array_name.split('_')[1])
+    #         full_band_name = self.reduced_to_full_index_map[iband]
+    #         print(new_color_array)
+    #         self.point_data[f"band_{full_band_name}"] = np.array(new_color_array)
+    #     self.point_data["bands"] = np.array(combined_band_color_array)
+    #     return None
+
+    # def _apply_colors_to_bands(self):
+
+    #     nsurface = len(self.isosurfaces)
+    #     if self.surface_color:
+    #         solid_color_surface = np.arange(nsurface ) / nsurface
+
+    #         if isinstance(self.surface_color,str):
+    #             surface_color = mpcolors.to_rgba_array(self.surface_color, alpha =1 )[0,:]
+    #         self.bands_color = np.array([surface_color for x in solid_color_surface[:]]).reshape(-1, 4)
+
+    #     elif self.colors:
+    #         self.bands_color =[]
+    #         for color in self.colors:
+    #             if isinstance(color,str):
+    #                 color = mpcolors.to_rgba_array(color, alpha =1 )[0,:]
+    #                 self.bands_color.append(color)
+    #     else:
+    #         norm = mpcolors.Normalize(vmin=self.vmin, vmax=self.vmax)
+    #         cmap = cm.get_cmap(self.cmap)
+    #         solid_color_surface = np.arange(nsurface ) / nsurface
+    #         self.bands_color = np.array([cmap(norm(x)) for x in solid_color_surface[:]]).reshape(-1, 4)
+
+
+
+    #     for i_band,isosurface in enumerate(self.isosurfaces):
+    #         n_points = len(isosurface.points[:,0])
+    #         band_color = np.array([self.bands_color[i_band,:]]*n_points)
+    #         # isosurface.point_data[f"band"] = band_color
+
+    #         full_band_name = self.reduced_to_full_index_map[i_band]
+    #         isosurface.point_data[f"band_{full_band_name}"] = band_color
+
+    #     return self.bands_color
+    
+    # def create_vector_texture(self,
+    #                         vectors_array: np.ndarray, 
+    #                         vectors_name: str="vector" ):
+    #     """
+    #     This method will map a list of vector to the 3d fermi surface mesh
+
+    #     Parameters
+    #     ----------
+    #     vectors_array : np.ndarray
+    #         The vector array corresponding to the kpoints
+    #     vectors_name : str, optional
+    #         The name of the vectors, by default "vector"
+    #     """
+        
+    #     final_vectors_X = []
+    #     final_vectors_Y = []
+    #     final_vectors_Z = []
+    #     for iband, isosurface in enumerate(self.isosurfaces):
+    #         XYZ_extended = self.XYZ.copy()
+    #         vectors_extended_X = vectors_array[:,iband,0].copy()
+    #         vectors_extended_Y = vectors_array[:,iband,1].copy()
+    #         vectors_extended_Z = vectors_array[:,iband,2].copy()
+    
+    #         for ix in range(3):
+    #             for iy in range(self.supercell[ix]):
+    #                 temp = self.XYZ.copy()
+    #                 temp[:, ix] += 1 * (iy + 1)
+    #                 XYZ_extended = np.append(XYZ_extended, temp, axis=0)
+    #                 vectors_extended_X = np.append(
+    #                     vectors_extended_X, vectors_array[:,iband,0], axis=0
+    #                 )
+    #                 vectors_extended_Y = np.append(
+    #                     vectors_extended_Y, vectors_array[:,iband,1], axis=0
+    #                 )
+    #                 vectors_extended_Z = np.append(
+    #                     vectors_extended_Z, vectors_array[:,iband,2], axis=0
+    #                 )
+    #                 temp = self.XYZ.copy()
+    #                 temp[:, ix] -= 1 * (iy + 1)
+    #                 XYZ_extended = np.append(XYZ_extended, temp, axis=0)
+    #                 vectors_extended_X = np.append(
+    #                     vectors_extended_X, vectors_array[:,iband,0], axis=0
+    #                 )
+    #                 vectors_extended_Y = np.append(
+    #                     vectors_extended_Y, vectors_array[:,iband,1], axis=0
+    #                 )
+    #                 vectors_extended_Z = np.append(
+    #                     vectors_extended_Z, vectors_array[:,iband,2], axis=0
+    #                 )
+    
+    #         XYZ_transformed = np.dot(XYZ_extended, self.ebs.reciprocal_lattice)
+    
+    #         if self.projection_accuracy.lower()[0] == "n":
+               
+    #             vectors_X = interpolate.griddata(
+    #                 XYZ_transformed, vectors_extended_X, isosurface.points, method="nearest"
+    #             )
+    #             vectors_Y = interpolate.griddata(
+    #                 XYZ_transformed, vectors_extended_Y, isosurface.points, method="nearest"
+    #             )
+    #             vectors_Z = interpolate.griddata(
+    #                 XYZ_transformed, vectors_extended_Z, isosurface.points, method="nearest"
+    #             )
+    
+    #         elif self.projection_accuracy.lower()[0] == "h":
+    
+    #             vectors_X = interpolate.griddata(
+    #                 XYZ_transformed, vectors_extended_X, isosurface.points, method="linear"
+    #             )
+    #             vectors_Y = interpolate.griddata(
+    #                 XYZ_transformed, vectors_extended_Y, isosurface.points, method="linear"
+    #             )
+    #             vectors_Z = interpolate.griddata(
+    #                 XYZ_transformed, vectors_extended_Z, isosurface.points, method="linear"
+    #             )
+
+    #         final_vectors_X.extend( vectors_X)
+    #         final_vectors_Y.extend( vectors_Y)
+    #         final_vectors_Z.extend( vectors_Z)
+                
+    #     self.set_vectors(final_vectors_X, final_vectors_Y, final_vectors_Z,vectors_name = vectors_name)
+    #     return None
+            
+    # def create_spin_texture(self):
+    #     """
+    #     This method will create the spin textures for the 3d fermi surface in the case of a non-colinear calculation
+    #     """
+    #     if self.spd_spin is not None:
+    #         XYZ_extended = self.XYZ.copy()
+    #         vectors_extended_X = self.spd_spin[0].copy()
+    #         vectors_extended_Y = self.spd_spin[1].copy()
+    #         vectors_extended_Z = self.spd_spin[2].copy()
+
+    #         for ix in range(3):
+    #             for iy in range(self.supercell[ix]):
+    #                 temp = self.XYZ.copy()
+    #                 temp[:, ix] += 1 * (iy + 1)
+    #                 XYZ_extended = np.append(XYZ_extended, temp, axis=0)
+    #                 vectors_extended_X = np.append(
+    #                     vectors_extended_X, self.spd_spin[0], axis=0
+    #                 )
+    #                 vectors_extended_Y = np.append(
+    #                     vectors_extended_Y, self.spd_spin[1], axis=0
+    #                 )
+    #                 vectors_extended_Z = np.append(
+    #                     vectors_extended_Z, self.spd_spin[2], axis=0
+    #                 )
+    #                 temp = self.XYZ.copy()
+    #                 temp[:, ix] -= 1 * (iy + 1)
+    #                 XYZ_extended = np.append(XYZ_extended, temp, axis=0)
+    #                 vectors_extended_X = np.append(
+    #                     vectors_extended_X, self.spd_spin[0], axis=0
+    #                 )
+    #                 vectors_extended_Y = np.append(
+    #                     vectors_extended_Y, self.spd_spin[1], axis=0
+    #                 )
+    #                 vectors_extended_Z = np.append(
+    #                     vectors_extended_Z, self.spd_spin[2], axis=0
+    #                 )
+
+
+
+    #         XYZ_transformed = np.dot(XYZ_extended, self.ebs.reciprocal_lattice)
+    #         if self.projection_accuracy.lower()[0] == "n":
+
+    #             spin_X = interpolate.griddata(
+    #                 XYZ_transformed, vectors_extended_X, self.points, method="nearest"
+    #             )
+    #             spin_Y = interpolate.griddata(
+    #                 XYZ_transformed, vectors_extended_Y, self.points, method="nearest"
+    #             )
+    #             spin_Z = interpolate.griddata(
+    #                 XYZ_transformed, vectors_extended_Z, self.points, method="nearest"
+    #             )
+
+    #         elif self.projection_accuracy.lower()[0] == "h":
+
+    #             spin_X = interpolate.griddata(
+    #                 XYZ_transformed, vectors_extended_X, self.points, method="linear"
+    #             )
+    #             spin_Y = interpolate.griddata(
+    #                 XYZ_transformed, vectors_extended_Y, self.points, method="linear"
+    #             )
+    #             spin_Z = interpolate.griddata(
+    #                 XYZ_transformed, vectors_extended_Z, self.points, method="linear"
+    #             )
+
+    #         self.set_vectors(spin_X, spin_Y, spin_Z)
+    #         return None
+   
+    # def project_color(self, 
+    #                 scalars_array:np.ndarray,
+    #                 scalar_name:str="scalars"):
+    #     """
+    #     Projects the scalars to the 3d fermi surface.
+
+    #     Parameters
+    #     ----------
+    #     scalars_array : np.array size[len(kpoints),len(self.bands)]   
+    #         the length of the self.bands is the number of bands with a fermi iso surface
+    #     scalar_name :str, optional
+    #         The name of the scalars, by default "scalars"
+        
+    #     Returns
+    #     -------
+    #     None.
+    #     """
+    #     final_scalars = []
+    #     for iband, isosurface in enumerate(self.isosurfaces):
+    #         XYZ_extended = self.XYZ.copy()
+    #         scalars_extended =  scalars_array[:,iband].copy()
+    
+    
+    #         for ix in range(3):
+    #             for iy in range(self.supercell[ix]):
+    #                 temp = self.XYZ.copy()
+    #                 temp[:, ix] += 1 * (iy + 1)
+    #                 XYZ_extended = np.append(XYZ_extended, temp, axis=0)
+    #                 scalars_extended = np.append(scalars_extended,  scalars_array[:,iband], axis=0)
+    #                 temp = self.XYZ.copy()
+    #                 temp[:, ix] -= 1 * (iy + 1)
+    #                 XYZ_extended = np.append(XYZ_extended, temp, axis=0)
+    #                 scalars_extended = np.append(scalars_extended,  scalars_array[:,iband], axis=0)
   
-    def calculate_first_and_second_derivative_energy_band(self, 
-                                                        iband: int):
-        """Helper method to calculate the first and second derivative of a band
+    #         XYZ_transformed = np.dot(XYZ_extended, self.ebs.reciprocal_lattice)
+    
+    #         if self.projection_accuracy.lower()[0] == "n":
+    #             colors = interpolate.griddata(
+    #                 XYZ_transformed, scalars_extended, isosurface.centers, method="nearest"
+    #             )
+    #         elif self.projection_accuracy.lower()[0] == "h":
+    #             colors = interpolate.griddata(
+    #                 XYZ_transformed, scalars_extended, isosurface.centers, method="linear"
+    #             )
+                
+    #         final_scalars.extend(colors)
 
-        Parameters
-        ----------
-        iband : int
-            The band index
-        """
+    #     self.set_scalars(final_scalars, scalar_name = scalar_name)
+    #     return None
 
-        
-        def get_energy(kp_reduced: np.ndarray):
-            return kp_reduced_to_energy[f'({kp_reduced[0]},{kp_reduced[1]},{kp_reduced[2]})']
-        def get_cartesian_kp(kp_reduced: np.ndarray):
-            return kp_reduced_to_kp_cart[f'({kp_reduced[0]},{kp_reduced[1]},{kp_reduced[2]})']
-        def energy_meshgrid_mapping(mesh_list):
-            mesh_list_cart = copy.deepcopy(mesh_list)
-            F = np.zeros(shape = mesh_list[0].shape)
-            for k in range(mesh_list[0].shape[2]):
-                for j in range(mesh_list[0].shape[1]):
-                    for i in range(mesh_list[0].shape[0]):
-                        kx = mesh_list[0][i,j,k]
-                        ky = mesh_list[1][i,j,k]
-                        kz = mesh_list[2][i,j,k]
-        
-                        mesh_list_cart[0][i,j,k] = get_cartesian_kp([kx,ky,kz])[0]
-                        mesh_list_cart[1][i,j,k] = get_cartesian_kp([kx,ky,kz])[1]
-                        mesh_list_cart[2][i,j,k] = get_cartesian_kp([kx,ky,kz])[2]
-                        F[i,j,k] = get_energy([kx,ky,kz])
-        
-            return F
-        def fermi_velocity_meshgrid_mapping(mesh_list):
-            X = np.zeros(shape = mesh_list[0].shape)
-            Y = np.zeros(shape = mesh_list[0].shape)
-            Z = np.zeros(shape = mesh_list[0].shape)
-            for k in range(mesh_list[0].shape[2]):
-                for j in range(mesh_list[0].shape[1]):
-                    for i in range(mesh_list[0].shape[0]):
-                        kx = mesh_list[0][i,j,k]
-                        ky = mesh_list[1][i,j,k]
-                        kz = mesh_list[2][i,j,k]
-                        
-                        X[i,j,k] = get_gradient([kx,ky,kz])[0]
-                        Y[i,j,k] = get_gradient([kx,ky,kz])[1]
-                        Z[i,j,k] = get_gradient([kx,ky,kz])[2]
-        
-            return X,Y,Z
-        
-        kpoints_cart = np.matmul(self.XYZ,  self.reciprocal_lattice)
-        
-        mesh_list = np.meshgrid(np.unique(self.XYZ[:,0]),
-                                np.unique(self.XYZ[:,1]),
-                                np.unique(self.XYZ[:,2]), indexing = 'ij')
-        
-        print(self.bands.shape)
-        kp_reduced_to_energy = {f'({key[0]},{key[1]},{key[2]})':value for (key,value) in zip(self.XYZ,self.bands[:,iband])}
-        kp_reduced_to_kp_cart = {f'({key[0]},{key[1]},{key[2]})':value for (key,value) in zip(self.XYZ,kpoints_cart)}
-        kp_reduced_to_mesh_index = {f'({kp[0]},{kp[1]},{kp[2]})': np.argwhere((mesh_list[0]==kp[0]) & 
-                                                                              (mesh_list[1]==kp[1]) & 
-                                                                              (mesh_list[2]==kp[2]) )[0] for kp in self.XYZ}
-        
-        
-        energy_meshgrid = energy_meshgrid_mapping(mesh_list) 
 
-        change_in_energy = np.gradient(energy_meshgrid)
+    # def calculate_fermi_velocity(self):
+    #     """
+    #     Method to calculate the fermi velocity of the surface.
+    #     """
+    #     vectors_array=vectors_array
+    #     self.create_vector_texture( vectors_array = vectors_array, vectors_name = "Fermi Velocity Vector"  )  
 
-        grad_x_list = [change_in_energy[0][kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][0],
-                  kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][1],
-                  kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][2]
-                  ]
-                  for kp in self.XYZ]
-        grad_y_list = [change_in_energy[1][kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][0],
-                              kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][1],
-                              kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][2]
-                              ]
-                  for kp in self.XYZ]
-        grad_z_list = [change_in_energy[2][kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][0],
-                              kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][1],
-                              kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][2]
-                              ]
-                  for kp in self.XYZ]
-        
-        
-        gradient_list = np.array([grad_x_list,grad_y_list,grad_z_list]).T
+    # def calculate_fermi_speed(self):
+    #     """
+    #     Method to calculate the fermi speed of the surface.
+    #     """
+    #     scalars_array=None
+    #     self.project_color(scalars_array = scalars_array, scalar_name = "Fermi Speed")
 
-        lattice = np.linalg.inv(self.reciprocal_lattice.T).T
+    # def calculate_effective_mass(self):
+    #     """
+    #     Method to calculate the effective mass of the surface.
+    #     """
+    #     scalars_array=None
+    #     self.project_color(scalars_array = scalars_array, scalar_name="Geometric Average Effective Mass")
 
-      
-        gradient_list = gradient_list/(2*math.pi)
-        gradient_list = np.multiply(gradient_list, np.array([np.linalg.norm(lattice[:,0])*METER_ANGSTROM * len(np.unique(self.XYZ[:,0])),
-                                                             np.linalg.norm(lattice[:,1])*METER_ANGSTROM * len(np.unique(self.XYZ[:,1])),
-                                                             np.linalg.norm(lattice[:,2])*METER_ANGSTROM * len(np.unique(self.XYZ[:,2]))])
-                            )
-        
+    # def project_atomic_projections(self):
+    #     """
+    #     Method to calculate the atomic projections of the surface.
+    #     """
 
         
-        gradient_list_cart = np.array([np.matmul(lattice, gradient) for gradient in gradient_list])
-        
+    #     self.spd = self.spd[:,self.fullBandIndex]
 
-        # kp_reduced_to_grad_x = {f'({key[0]},{key[1]},{key[2]})':value for (key,value) in zip(self.XYZ,grad_x_list)}
-        # kp_reduced_to_grad_y = {f'({key[0]},{key[1]},{key[2]})':value for (key,value) in zip(self.XYZ,grad_y_list)}
-        # kp_reduced_to_grad_z = {f'({key[0]},{key[1]},{key[2]})':value for (key,value) in zip(self.XYZ,grad_z_list)}
-        
-        group_velocity_x = gradient_list_cart[:,0]/HBAR_EV
-        group_velocity_y = gradient_list_cart[:,1]/HBAR_EV
-        group_velocity_z = gradient_list_cart[:,2]/HBAR_EV
-        
-        group_velocity_vector = [group_velocity_x,group_velocity_y,group_velocity_z]
-        
-        group_velocity_magnitude = (group_velocity_x**2 + 
-                                    group_velocity_y**2 + 
-                                    group_velocity_z**2)**0.5
+    #     scalars_array = []
+    #     count = 0
+    #     for iband in range(len(self.isosurfaces)):
+    #         count+=1
+    #         scalars_array.append(self.spd[:,iband])
+    #     scalars_array = np.vstack(scalars_array).T
+    #     self.project_color(scalars_array = scalars_array, scalar_name = "scalars")
 
-        kp_reduced_to_gradient = {f'({key[0]},{key[1]},{key[2]})':value for (key,value) in zip(self.XYZ,gradient_list_cart)}
-        def get_gradient(kp_reduced):
-            return kp_reduced_to_gradient[f'({kp_reduced[0]},{kp_reduced[1]},{kp_reduced[2]})']
-        
-        gradient_mesh = list(fermi_velocity_meshgrid_mapping(mesh_list))
-        change_in_energy_gradient = list(map(np.gradient,gradient_mesh))
-        
-        
-        
-        grad_xx_list = [change_in_energy_gradient[0][0][kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][0],
-                                                        kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][1],
-                                                        kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][2]
-                                                        ]
-                        for kp in self.XYZ]
-        grad_xy_list = [change_in_energy_gradient[0][1][kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][0],
-                                                        kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][1],
-                                                        kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][2]
-                                                        ]
-                        for kp in self.XYZ]
-        grad_xz_list = [change_in_energy_gradient[0][2][kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][0],
-                                                        kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][1],
-                                                        kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][2]
-                                                        ]
-                        for kp in self.XYZ]
-        
-        grad_yx_list = [change_in_energy_gradient[1][0][kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][0],
-                                                        kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][1],
-                                                        kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][2]
-                                                        ]
-                        for kp in self.XYZ]
-        grad_yy_list = [change_in_energy_gradient[1][1][kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][0],
-                                                        kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][1],
-                                                        kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][2]
-                                                        ]
-                        for kp in self.XYZ]
-        grad_yz_list = [change_in_energy_gradient[1][2][kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][0],
-                                                        kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][1],
-                                                        kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][2]
-                                                        ]
-                        for kp in self.XYZ]
-        
-        grad_zx_list = [change_in_energy_gradient[2][0][kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][0],
-                                                        kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][1],
-                                                        kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][2]
-                                                        ]
-                        for kp in self.XYZ]
-        grad_zy_list = [change_in_energy_gradient[2][1][kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][0],
-                                                        kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][1],
-                                                        kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][2]
-                                                        ]
-                        for kp in self.XYZ]
-        grad_zz_list = [change_in_energy_gradient[2][2][kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][0],
-                                                        kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][1],
-                                                        kp_reduced_to_mesh_index[f'({kp[0]},{kp[1]},{kp[2]})'][2]
-                                                        ]
-                        for kp in self.XYZ]
-        
-        energy_second_derivative_list = np.array([[grad_xx_list,grad_xy_list,grad_xz_list],
-                                         [grad_yx_list,grad_yy_list,grad_yz_list],
-                                         [grad_zx_list,grad_zy_list,grad_zz_list],
-                                         ])
-        
-        energy_second_derivative_list = np.swapaxes(energy_second_derivative_list,axis1=0,axis2=2)
-        energy_second_derivative_list = np.swapaxes(energy_second_derivative_list,axis1=1,axis2=2)
-        energy_second_derivative_list = energy_second_derivative_list/(2*math.pi)
-        energy_second_derivative_list = np.multiply(energy_second_derivative_list, np.array([np.linalg.norm(lattice[:,0])*METER_ANGSTROM * len(np.unique(self.XYZ[:,0])),
-                                                                                                       np.linalg.norm(lattice[:,1])*METER_ANGSTROM * len(np.unique(self.XYZ[:,1])),
-                                                                                                       np.linalg.norm(lattice[:,2])*METER_ANGSTROM * len(np.unique(self.XYZ[:,2]))])
-                                                    )
-        energy_second_derivative_list_cart = energy_second_derivative_list_cart = np.array([ [ np.matmul(lattice,gradient) for gradient in gradient_tensor ] for gradient_tensor in energy_second_derivative_list ])
-        
-        inverse_effective_mass_tensor_list = energy_second_derivative_list_cart * EV_TO_J/ HBAR_J**2
-        effective_mass_tensor_list = np.array([ np.linalg.inv(inverse_effective_mass_tensor) for inverse_effective_mass_tensor in inverse_effective_mass_tensor_list])
-        effective_mass_list = np.array([ (3*(1/effective_mass_tensor_list[ikp,0,0] + 
-                                                  1/effective_mass_tensor_list[ikp,1,1] +
-                                                  1/effective_mass_tensor_list[ikp,2,2])**-1)/FREE_ELECTRON_MASS for ikp in range(len(self.XYZ))])
-        return (group_velocity_vector, group_velocity_magnitude, effective_mass_tensor_list,
-                effective_mass_list, gradient_list, gradient_list_cart)
+    # def project_spin_texture_atomic_projections(self):
+    #     """
+    #     Method to calculate atomic spin texture projections of the surface.
+    #     """
+    #     if self.spd_spin[0] is not None:
+    #         self.spd_spin = self.spd_spin[:,self.fullBandIndex,:]
+    #     vectors_array = self.spd_spin
 
-    def calculate_first_and_second_derivative_energy(self):
-        """
-        Helper method which calculates the first and secoond derivative of all bands.
-        """
+    #     self.create_vector_texture(vectors_array = vectors_array, vectors_name = "spin" )
+   
+    # def extend_surface(self,  extended_zone_directions: List[List[int] or Tuple[int,int,int]]=None,):
+    #     """
+    #     Method to extend the surface in the direction of a reciprocal lattice vecctor
+
+    #     Parameters
+    #     ----------
+    #     extended_zone_directions : List[List[int] or Tuple[int,int,int]], optional
+    #         List of directions to expand to, by default None
+    #     """
         
-        self.first_and_second_derivative_energy_property_dict = {}
-        for iband in range(len(self.bands[0,:])):
-            group_velocity_vector,group_velocity_magnitude,effective_mass_tensor_list,effective_mass_list,gradient_list, gradient_list_cart = self.calculate_first_and_second_derivative_energy_band(iband)
-            self.first_and_second_derivative_energy_property_dict.update({f"band_{iband}" : {"group_velocity_vector" : group_velocity_vector,
-                                                                                        "group_velocity_magnitude": group_velocity_magnitude,
-                                                                                        "effective_mass_tensor_list":effective_mass_tensor_list,
-                                                                                        "effective_mass_list":effective_mass_list}
-                                                                })
-
-    def calculate_fermi_velocity(self):
-        """
-        Method to calculate the fermi velocity of the surface.
-        """
-        self.calculate_first_and_second_derivative_energy()
-
-        vectors_array = []
-        for band_name in self.first_and_second_derivative_energy_property_dict.keys():
-            vectors_array.append(self.first_and_second_derivative_energy_property_dict[band_name]["group_velocity_vector"])
-            
-        vectors_array = np.array(vectors_array).T
-        vectors_array = np.swapaxes(vectors_array,axis1 = 1,axis2 = 2)
-
-        self.create_vector_texture( vectors_array = vectors_array, vectors_name = "Fermi Velocity Vector"  )  
-
-    def calculate_fermi_speed(self):
-        """
-        Method to calculate the fermi speed of the surface.
-        """
-        self.calculate_first_and_second_derivative_energy()
-
-        scalars_array = []
-        for band_name in self.first_and_second_derivative_energy_property_dict.keys():
-            scalars_array.append(self.first_and_second_derivative_energy_property_dict[band_name]["group_velocity_magnitude"])
-            
-        scalars_array = np.vstack(scalars_array).T 
-        
-        self.project_color(scalars_array = scalars_array, scalar_name = "Fermi Speed")
-
-    def calculate_effective_mass(self):
-        """
-        Method to calculate the effective mass of the surface.
-        """
-        self.calculate_first_and_second_derivative_energy()
-
-        scalars_array = []
-        for band_name in self.first_and_second_derivative_energy_property_dict.keys():
-            scalars_array.append(self.first_and_second_derivative_energy_property_dict[band_name]["effective_mass_list"])
-        scalars_array = np.vstack(scalars_array).T 
-        
-        self.project_color(scalars_array = scalars_array, scalar_name="Geometric Average Effective Mass")
-
-    def project_atomic_projections(self):
-        """
-        Method to calculate the atomic projections of the surface.
-        """
-
-        
-        self.spd = self.spd[:,self.fullBandIndex]
-
-        scalars_array = []
-        count = 0
-        for iband in range(len(self.isosurfaces)):
-            count+=1
-            scalars_array.append(self.spd[:,iband])
-        scalars_array = np.vstack(scalars_array).T
-        self.project_color(scalars_array = scalars_array, scalar_name = "scalars")
-
-    def project_spin_texture_atomic_projections(self):
-        """
-        Method to calculate atomic spin texture projections of the surface.
-        """
-        if self.spd_spin[0] is not None:
-            self.spd_spin = self.spd_spin[:,self.fullBandIndex,:]
-        vectors_array = self.spd_spin
-
-        self.create_vector_texture(vectors_array = vectors_array, vectors_name = "spin" )
-    """
-        Method to extend the surface in reciprocal lattice vecctor
-        Args:
-            extended_zone_directions (List[List[int] or Tuple[int,int,int]], optional): List of directions to extend the surface. Defaults to None.
-        """
-    def extend_surface(self,  extended_zone_directions: List[List[int] or Tuple[int,int,int]]=None,):
-        """
-        Method to extend the surface in the direction of a reciprocal lattice vecctor
-
-        Parameters
-        ----------
-        extended_zone_directions : List[List[int] or Tuple[int,int,int]], optional
-            List of directions to expand to, by default None
-        """
-        
-        # The following code  creates exteneded surfaces in a given direction
-        extended_surfaces = []
-        if extended_zone_directions is not None:
-            original_surface = copy.deepcopy(self) 
-            for direction in extended_zone_directions:
-                surface = copy.deepcopy(original_surface)
-                self += surface.translate(np.dot(direction, self.reciprocal_lattice))
-            #Clearing unneeded surface from memory
-            del original_surface
-            del surface
+    #     # The following code  creates exteneded surfaces in a given direction
+    #     extended_surfaces = []
+    #     if extended_zone_directions is not None:
+    #         original_surface = copy.deepcopy(self) 
+    #         for direction in extended_zone_directions:
+    #             surface = copy.deepcopy(original_surface)
+    #             self += surface.translate(np.dot(direction, self.ebs.reciprocal_lattice))
+    #         #Clearing unneeded surface from memory
+    #         del original_surface
+    #         del surface
 
     def _get_brilloin_zone(self, 
                         supercell: List[int]):
@@ -751,5 +728,163 @@ class FermiSurface3D(Surface):
             The BrillouinZone of the material
         """
 
-        return BrillouinZone(self.reciprocal_lattice, supercell)
+        return BrillouinZone(self.ebs.reciprocal_lattice, supercell)
 
+
+
+
+# def __init__(
+#         self,
+#         kpoints: np.ndarray,
+#         bands: np.ndarray,
+#         fermi: float,
+#         reciprocal_lattice: np.ndarray,
+
+#         ebs=None,
+#         bands_to_keep: List[int]=None,
+#         spin: int= 0,
+#         spd: np.ndarray=None,
+#         spd_spin:np.ndarray=None,
+
+#         fermi_shift: float=0.0,
+#         fermi_tolerance:float=0.1,
+#         interpolation_factor: int=1,
+#         colors: List[str] or List[Tuple[float,float,float]]=None,
+#         surface_color: str or Tuple[float,float,float, float]=None,
+#         projection_accuracy: str="Normal",
+#         cmap: str="viridis",
+#         vmin: float=0,
+#         vmax: float=1,
+#         supercell: List[int]=[1, 1, 1],
+#         # sym: bool=False
+#         ):
+
+#         self.ebs = ebs.deepcopy()
+
+
+#         self.kpoints = kpoints
+        
+#         # Shifts kpoints between [0.5,0.5)
+#         bound_ops = -1.0*(self.ebs.kpoints > 0.5) + 1.0*(self.ebs.kpoints <= -0.5)
+#         self.XYZ = self.ebs.kpoints + bound_ops
+
+#         self.reciprocal_lattice = reciprocal_lattice
+
+#         self.supercell = np.array(supercell)
+#         self.fermi = fermi + fermi_shift
+#         self.interpolation_factor = interpolation_factor
+#         self.projection_accuracy = projection_accuracy
+#         self.spd = spd
+#         self.spd_spin = spd_spin
+
+#         self.brillouin_zone = self._get_brilloin_zone(self.supercell)
+
+#         self.cmap = cmap
+#         self.vmin = vmin
+#         self.vmax = vmax
+        
+#         # Finding bands with a fermi iso-surface. This reduces searching
+#         self.ebs.bands = self.ebs.bands[:,:,spin]
+#         if bands_to_keep is None:
+#             bands_to_keep = len(self.ebs.bands[0,:])
+#         elif len(bands_to_keep) < len(self.bands[0,:]) :
+#             self.ebs.bands = self.ebs.bands[:,bands_to_keep]
+
+#         fullBandIndex = []
+#         reducedBandIndex = []
+#         for iband in range(len(self.ebs.bands[0,:])):
+#             fermi_surface_test = len(np.where(np.logical_and(self.ebs.bands[:,iband]>=self.fermi-fermi_tolerance, self.ebs.bands[:,iband]<=self.fermi+fermi_tolerance))[0])
+#             if fermi_surface_test != 0:
+#                 fullBandIndex.append(iband)
+#         if len(fullBandIndex)==0:
+#             raise Exception("No bands within tolerance. Increase tolerance to increase search space.")
+#         self.ebs.bands = self.ebs.bands[:,fullBandIndex]
+
+#         # re-index and creates a mapping to the original bandindex
+#         reducedBandIndex = np.arange(len(self.ebs.bands[0,:]))
+#         self.fullBandIndex = fullBandIndex
+#         self.reducedBandIndex = reducedBandIndex
+#         self.reducedBandIndex_to_fullBandIndex = {f"{key}":value for key,value in zip(reducedBandIndex,fullBandIndex)}
+#         self.fullBandIndex_to_reducedBandIndex = {f"{key}":value for key,value in zip(fullBandIndex,reducedBandIndex)}
+#         reduced_bands_to_keep_index = [iband for iband in range(len(bands_to_keep))]
+
+#         # Generate unique rgba values for the bands
+#         nsurface = len(self.ebs.bands[0,:])
+#         if surface_color:
+#             solid_color_surface = np.arange(nsurface ) / nsurface
+
+#             if isinstance(surface_color,str):
+#                 surface_color = mpcolors.to_rgba_array(surface_color, alpha =1 )[0,:]
+#             band_colors = np.array([surface_color for x in solid_color_surface[:]]).reshape(-1, 4)
+#         elif colors:
+#             band_colors =[]
+#             for color in colors:
+#                 if isinstance(color,str):
+#                     color = mpcolors.to_rgba_array(color, alpha =1 )[0,:]
+#                     band_colors.append(color)
+#         else:
+#             norm = mpcolors.Normalize(vmin=vmin, vmax=vmax)
+#             cmap = cm.get_cmap(cmap)
+#             solid_color_surface = np.arange(nsurface ) / nsurface
+#             band_colors = np.array([cmap(norm(x)) for x in solid_color_surface[:]]).reshape(-1, 4)
+
+#         # The following loop generates iso surfaces for each band and then stores them in a list
+#         color_band_dict = {}
+
+#         self.isosurfaces = []
+#         full_isosurface = None
+#         iband_with_surface=0
+#         for iband in  range(self.ebs.bands.shape[1]):
+#             isosurface_band = Isosurface(
+#                                 XYZ=self.XYZ,
+#                                 V=self.ebs.bands[:,iband],
+#                                 isovalue=self.fermi,
+#                                 algorithm="lewiner",
+#                                 interpolation_factor=interpolation_factor,
+#                                 padding=self.supercell,
+#                                 transform_matrix=self.reciprocal_lattice,
+#                                 boundaries=self.brillouin_zone,
+#                             )
+
+#             # Following condition will handle initializing of fermi isosurface
+#             isosurface_band_copy = copy.deepcopy(isosurface_band)
+#             if full_isosurface is None and len(isosurface_band_copy.points)!=0:
+#                 full_isosurface = isosurface_band_copy    
+#             elif len(isosurface_band_copy.points)==0:
+#                 if full_isosurface is None and iband == len(self.ebs.bands[0,:])-1:
+#                     # print(full_isosurface)
+#                     raise Exception("Could not find any fermi surfaces")
+#                 continue
+#             else:    
+#                 full_isosurface += isosurface_band_copy
+
+#             color_band_dict.update({f"band_{iband_with_surface}": {"color" : band_colors[iband_with_surface,:]} })
+#             band_color = np.array([band_colors[iband_with_surface,:]]*len(isosurface_band.points[:,0]))
+#             isosurface_band.point_data[f"band_{iband_with_surface}"] = band_color
+#             self.isosurfaces.append(isosurface_band)
+#             iband_with_surface +=1
+
+#         # Initialize the Fermi Surface which is the combination of all the 
+#         # isosurface for each band
+#         super().__init__(verts=full_isosurface.points, faces=full_isosurface.faces)
+#         self.fermi_surface_area = self.area
+        
+#         # Remapping of the scalar arrays into the combind mesh  
+#         count = 0
+#         combined_band_color_array = []
+#         for iband,isosurface_band in enumerate(self.isosurfaces):
+#             new_color_array = []
+#             color_array_name = isosurface_band.point_data.keys()[0]
+#             for points in self.points:
+#                 if points in isosurface_band.points:
+#                     new_color_array.append(color_band_dict[color_array_name]['color'])    
+#                 else:
+#                     new_color_array.append(np.array([0,0,0,1]))
+
+#             for ipoints in range(len(isosurface_band.points)):
+#                 combined_band_color_array.append(color_band_dict[color_array_name]['color'])
+#             i_reduced_band = color_array_name.split('_')[1]
+
+#             self.point_data[ "band_"+ str(self.reducedBandIndex_to_fullBandIndex[str(i_reduced_band)])] = np.array(new_color_array)
+#         self.point_data["bands"] = np.array(combined_band_color_array ) 
+#         return None
