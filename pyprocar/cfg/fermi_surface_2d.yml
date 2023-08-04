@@ -56,7 +56,7 @@ marker:
   value: .
 dpi:
   description: The dpi value to save the image as
-  value: figure
+  value: 600
 
 x_label:
   description: The x label of the plot
